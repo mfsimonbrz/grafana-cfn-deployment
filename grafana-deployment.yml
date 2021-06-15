@@ -1,0 +1,436 @@
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Deployment Configuration'
+        Parameters:
+          - EnvironmentType
+      - Label:
+          default: 'Administration Configuration'
+        Parameters:
+          - DatabasePassword
+          - UserIp
+          - UserKeyPair      
+    ParameterLabels:
+      EnvironmentType:
+        default: 'Type of deployment'
+      UserIp:
+        default: 'User IP'
+      UserKeyPair:
+        default: 'Instance Keypair'
+      DatabasePassword:
+        default: 'Database password'
+
+Parameters:
+  EnvironmentType:
+    Type: String
+    Default: dev
+    Description: 'Choose the type of deployment (development or production)'
+    AllowedValues:
+      - dev
+      - prod
+  UserIp:
+    Type: String
+    MinLength: 5
+    Description: 'Type your IP in the CIDR block format. This will be used for instance administration'
+    ConstraintDescription: 'Please type your IP in the CIDR block format'
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}(\/(32))$'
+  UserKeyPair:
+    Type: AWS::EC2::KeyPair::KeyName    
+    Description: 'Choose a keypair for access the instances'
+  DatabasePassword:
+    Type: String
+    Description: 'Type the master password for the Grafana database'
+    AllowedPattern: '^([\w#]){12,16}$'
+    NoEcho: true
+
+Mappings:
+  ImageMapping:
+    us-east-1:
+      amd64: 'ami-0db6c6238a40c0681'
+    us-east-2:
+      amd64: 'ami-03b6c8bd55e00d5ed'
+
+Conditions:
+  CreateDevResources: !Equals [!Ref EnvironmentType, "dev"]
+Resources:
+  # Network definitions
+  ApplicationNetwork:    
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: grafana-network
+  
+  FirstPublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref ApplicationNetwork
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true      
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["grafana", "public", !Select [0, Fn::GetAZs: !Ref 'AWS::Region']]]
+
+  SecondPublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref ApplicationNetwork
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true      
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["grafana", "public", !Select [1, Fn::GetAZs: !Ref 'AWS::Region']]]
+
+  FirstPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref ApplicationNetwork
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: false      
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["grafana", "private", !Select [0, Fn::GetAZs: !Ref 'AWS::Region']]]
+
+  SecondPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref ApplicationNetwork
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: false      
+      Tags:
+        - Key: Name
+          Value: !Join ["-", ["grafana", "private", !Select [1, Fn::GetAZs: !Ref 'AWS::Region']]]
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    DependsOn:
+      - FirstPrivateSubnet
+      - SecondPrivateSubnet
+    Properties:
+      DBSubnetGroupDescription: 'Subnet group for the Grafana database'
+      SubnetIds:
+        - !Ref FirstPrivateSubnet
+        - !Ref SecondPrivateSubnet
+      Tags:
+        - Key: Name
+          Value: grafana-db-subnet-group
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: grafana-igw
+  
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      VpcId: !Ref ApplicationNetwork
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      VpcId: !Ref ApplicationNetwork
+      Tags:
+        - Key: Name
+          Value: grafana-rtb
+
+  RouteToInternet:
+    Type: AWS::EC2::Route
+    DependsOn:
+      - InternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  FirstPublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - FirstPublicSubnet
+      - PublicRouteTable
+    Properties:
+      SubnetId: !Ref FirstPublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  SecondPublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn:
+      - SecondPublicSubnet
+      - PublicRouteTable
+    Properties:
+      SubnetId: !Ref SecondPublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  #Security groups definitions
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - ApplicationNetwork
+      - LoadBalancerSecurityGroup
+    Properties:
+      GroupName: 'grafana-application-security-group'
+      GroupDescription: 'Security group for Grafana application instances'
+      VpcId: !Ref ApplicationNetwork
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref UserIp
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'      
+      Tags:
+        - Key: Name
+          Value: 'grafana-application-security-group'
+
+  DatabaseSecurityGroup:  
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      GroupName: 'grafana-database-security-group'
+      GroupDescription: 'Security group for Grafana database (Postgres)'
+      VpcId: !Ref ApplicationNetwork
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ApplicationSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'      
+      Tags:
+        - Key: Name
+          Value: 'grafana-database-security-group'
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn:
+      - ApplicationNetwork
+    Properties:
+      GroupName: 'elb-security-group'
+      GroupDescription: 'Security group for the load balancer'      
+      VpcId:  !Ref ApplicationNetwork
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'        
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Name
+          Value: 'elb-security-group'
+
+  GrafanaDatabase:
+    Type: AWS::RDS::DBInstance
+    DependsOn: 
+        - DatabaseSecurityGroup
+        - DatabaseSubnetGroup        
+    Properties:
+      AllocatedStorage: 50
+      DBInstanceClass: !If [CreateDevResources, db.t2.micro, db.t3.medium]
+      MultiAZ: !If [CreateDevResources, false, true]
+      AvailabilityZone: !Select [0, Fn::GetAZs: !Ref 'AWS::Region']
+      BackupRetentionPeriod: 7      
+      DBInstanceIdentifier: grafana-database
+      DBName: grafana
+      VPCSecurityGroups: 
+        - !Ref DatabaseSecurityGroup
+      Engine: postgres
+      EngineVersion: '12.5'
+      MasterUsername: grafana
+      MasterUserPassword: !Ref DatabasePassword
+      PreferredBackupWindow: 01:00-02:00
+      PreferredMaintenanceWindow: sat:03:00-sat:04:00
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      StorageType: gp2      
+      Tags:
+        - Key: Name
+          Value: grafana-database
+
+  #Launch template definition
+  ApplicationLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - GrafanaDatabase      
+    Properties:
+      LaunchTemplateName: grafana-launch-template
+      LaunchTemplateData: 
+        BlockDeviceMappings:
+          - DeviceName: '/dev/sda1'
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp2
+        KeyName: !Ref UserKeyPair
+        ImageId: !FindInMap
+          - ImageMapping
+          - !Ref AWS::Region
+          - amd64
+        InstanceType: !If [CreateDevResources, t2.micro, t3a.medium]
+        SecurityGroupIds:
+          - !Ref ApplicationSecurityGroup
+        UserData:
+          Fn::Base64: 
+            !Sub 
+              - |
+                #!/bin/sh
+                sudo apt-get install -y apt-transport-https
+                sudo apt-get install -y software-properties-common wget
+                wget -q -O - https://packages.grafana.com/gpg.key | sudo apt-key add -                
+                echo "deb https://packages.grafana.com/oss/deb stable main" | sudo tee -a /etc/apt/sources.list.d/grafana.list
+                sudo apt-get update
+                sudo apt-get install grafana -y                
+                sudo sed -i 's/;type = sqlite3/type = postgres/' /etc/grafana/grafana.ini            
+                sudo sed -i 's/;name = grafana/name = grafana/' /etc/grafana/grafana.ini
+                sudo sed -i 's/;user = root/user = grafana/' /etc/grafana/grafana.ini                                
+                sudo sed -i 's/;password =/password = """${DatabasePassword}"""/' /etc/grafana/grafana.ini              
+                sudo sed -i 's/;host = 127.0.0.1:3306/host = "${DatabaseEndpoint}"/' /etc/grafana/grafana.ini
+                systemctl start grafana-server
+
+              - DatabaseEndpoint : !GetAtt GrafanaDatabase.Endpoint.Address
+  
+  ApplicationASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - ApplicationLaunchTemplate
+      - ApplicationLoadBalancer      
+    Properties:      
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ApplicationLaunchTemplate
+        Version: !GetAtt ApplicationLaunchTemplate.LatestVersionNumber
+      MinSize: !If [CreateDevResources, 2, 3]
+      MaxSize: !If [CreateDevResources, 4, 5]
+      LoadBalancerNames:
+        - !Ref ApplicationLoadBalancer
+      VPCZoneIdentifier:
+        - !Ref FirstPublicSubnet
+        - !Ref SecondPublicSubnet
+      Tags:
+        - Key: Name
+          Value: grafana-instance
+          PropagateAtLaunch: True
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    DependsOn:
+      - ApplicationNetwork
+      - FirstPublicSubnet
+      - SecondPublicSubnet
+    Properties:
+      Scheme: internet-facing
+      Subnets:
+        - !Ref FirstPublicSubnet
+        - !Ref SecondPublicSubnet
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      LBCookieStickinessPolicy:
+        - PolicyName: 'grafana-stickiness-policy'
+          CookieExpirationPeriod: 300
+      Listeners:        
+        - LoadBalancerPort: '80'
+          InstancePort: '3000'
+          Protocol: HTTP
+          InstanceProtocol: HTTP
+      HealthCheck:
+        Target: 'HTTP:3000/api/health'
+        HealthyThreshold: 2
+        Interval: 300
+        Timeout: 60
+        UnhealthyThreshold: 2      
+
+  #autoscaling policies
+  ApplicationScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ApplicationASG
+      PolicyType: SimpleScaling
+      ScalingAdjustment: 1
+
+  ApplicationScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ApplicationASG
+      PolicyType: SimpleScaling
+      ScalingAdjustment: -1
+  
+  #cloudwatch alarms
+  ApplicationAlertUp:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      Period: 120
+      Statistic: Average
+      Threshold: 70
+      AlarmActions: 
+        - !Ref ApplicationScaleUpPolicy
+      AlarmName: GrafanaInstanceHighCPU
+      AlarmDescription: 'Fired when the CPU is higher than 70%'      
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ApplicationASG
+      Unit: Percent
+
+  ApplicationAlertDown:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      ComparisonOperator: LessThanOrEqualToThreshold
+      EvaluationPeriods: 2
+      Period: 120
+      Statistic: Average
+      Threshold: 30
+      AlarmActions: 
+        - !Ref ApplicationScaleDownPolicy
+      AlarmName: GrafanaInstanceLowCPU
+      AlarmDescription: 'Fired when the CPU is lower than 30%'
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ApplicationASG
+      Unit: Percent
+Outputs:  
+  GrafanaURL:
+    Description: 'Application URL'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
