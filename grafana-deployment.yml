@@ -265,6 +265,7 @@ Resources:
     Properties:
       AllocatedStorage: 50
       DBInstanceClass: !If [CreateDevResources, db.t2.micro, db.t3.medium]
+      MultiAZ: !If [CreateDevResources, false, true]
       AvailabilityZone: !Select [0, Fn::GetAZs: !Ref 'AWS::Region']
       BackupRetentionPeriod: 7      
       DBInstanceIdentifier: grafana-database
